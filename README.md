@@ -45,6 +45,10 @@ The output item file format is a JSON object with the following fields:
 Sample input and output files are available in the [sample_inputs](sample_inputs) and [sample_outputs](sample_outputs) directories. The files from the sample_inputs directory 
 can be moved into the [inputs](inputs) directory to be processed for testing.
 
+## AI/LLM
+This project is being developed by the Podcasting 2.0 community.  We are using AI/LLM's to assist with project management, coding and code review.
+The history of any LLM operations on this project can be found in the [.llm_history](.llm_history) folder.  Agent readable guidelines are in the
+[.junie/guidelines.md](.junie/guidelines.md) file.
 
 # Contributors
 - Dave Jones (gh: [@daveajones](https://github.com/daveajones))
