@@ -9,17 +9,22 @@ use serde::Serialize;
 use serde_json::Value as JsonValue;
 use xml::reader::{EventReader, XmlEvent};
 
+mod parser_state;
+mod tags;
+mod outputs;
+use parser_state::ParserState;
+
 // Global counter initialized to zero at program start
-static GLOBAL_COUNTER: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static GLOBAL_COUNTER: AtomicUsize = AtomicUsize::new(0);
 // Per-run output subfolder based on startup UNIX timestamp
-static OUTPUT_SUBDIR: OnceLock<PathBuf> = OnceLock::new();
+pub(crate) static OUTPUT_SUBDIR: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Serialize)]
 pub struct SqlInsert {
-    table: String,
-    columns: Vec<String>,
-    values: Vec<JsonValue>,
-    feed_id: Option<i64>,
+    pub table: String,
+    pub columns: Vec<String>,
+    pub values: Vec<JsonValue>,
+    pub feed_id: Option<i64>,
 }
 
 #[tokio::main]
@@ -231,242 +236,33 @@ fn process_feed_sync<R: Read>(reader: R, _source_name: &str, feed_id: Option<i64
     let cursor = Cursor::new(xml_bytes);
     let parser = EventReader::new(cursor);
 
-    // Variables to track extracted data
-    // Channel-level
-    let mut in_channel = false;
-    let mut in_channel_image = false; // avoid picking up <image><title>/<link> as channel title/link
-    let mut channel_title = String::new();
-    let mut channel_link = String::new();
-    let mut channel_description = String::new();
-
-    // Item-level
-    let mut in_item = false;
-    let mut current_element = String::new();
-    let mut title = String::new();
-    let mut link = String::new();
-    let mut description = String::new();
-    let mut pub_date = String::new();
-    let mut itunes_image = String::new();
-    let mut podcast_funding_url = String::new();
-    let mut podcast_funding_text = String::new();
-    let mut in_podcast_funding = false; // track when inside <podcast:funding>
+    // Parser state holds all flags and accumulators used by handlers
+    let mut state = ParserState::default();
 
     // Parse the XML document
     for event in parser {
         match event {
             //A tag is opened.
             Ok(XmlEvent::StartElement { name, attributes, .. }) => {
-                current_element = name.local_name.clone();
-                if current_element == "channel" {
-                    in_channel = true;
-                    // Reset channel-level fields when a new channel starts
-                    channel_title.clear();
-                    channel_link.clear();
-                    channel_description.clear();
-                    in_channel_image = false;
-                }
-
-                // Track when entering an <image> inside the channel (but not inside items)
-                if in_channel && !in_item && name.local_name == "image" {
-                    in_channel_image = true;
-                }
-                if current_element == "item" {
-                    in_item = true;
-                    // Clear previous data for new item
-                    title.clear();
-                    link.clear();
-                    description.clear();
-                    pub_date.clear();
-                    itunes_image.clear();
-                    podcast_funding_url.clear();
-                    podcast_funding_text.clear();
-                    in_podcast_funding = false;
-                }
-
-                // Handle itunes:image which is a self-closing tag with an href (or url) attribute
-                // We only capture it when inside an <item>
-                if in_item {
-                    let is_itunes_image = name.local_name == "image"
-                        && (matches!(name.prefix.as_deref(), Some("itunes"))
-                        || matches!(
-                                name.namespace.as_deref(),
-                                Some("http://www.itunes.com/dtds/podcast-1.0.dtd")
-                            ));
-
-                    if is_itunes_image {
-                        // Find the href or url attribute
-                        if let Some(attr) = attributes.iter().find(|a| {
-                            let key = a.name.local_name.as_str();
-                            key == "href" || key == "url"
-                        }) {
-                            itunes_image = attr.value.clone();
-                        }
-                    }
-
-                    // Detect podcast:funding start
-                    let is_podcast_funding = name.local_name == "funding"
-                        && (matches!(name.prefix.as_deref(), Some("podcast"))
-                        || matches!(
-                                name.namespace.as_deref(),
-                                Some("https://podcastindex.org/namespace/1.0")
-                            )
-                        || matches!(
-                                name.namespace.as_deref(),
-                                Some("http://podcastindex.org/namespace/1.0")
-                            ));
-
-                    if is_podcast_funding {
-                        in_podcast_funding = true;
-                        // capture optional url attribute
-                        if let Some(attr) = attributes.iter().find(|a| a.name.local_name == "url") {
-                            podcast_funding_url = attr.value.clone();
-                        }
-                    }
-                }
+                state.current_element = name.local_name.clone();
+                tags::dispatch_start(&name, &attributes, &mut state);
             }
 
             //Text is found.
             Ok(XmlEvent::Characters(data)) => {
-                if in_item {
-                    match current_element.as_str() {
-                        "title" => title.push_str(&data),
-                        "link" => link.push_str(&data),
-                        "description" => description.push_str(&data),
-                        "pubDate" => pub_date.push_str(&data),
-                        _ => {
-                            if in_podcast_funding {
-                                podcast_funding_text.push_str(&data);
-                            }
-                        }
-                    }
-                } else if in_channel && !in_channel_image {
-                    // Capture top-level channel fields (outside <item> and not inside <image>)
-                    match current_element.as_str() {
-                        "title" => channel_title.push_str(&data),
-                        "link" => channel_link.push_str(&data),
-                        "description" => channel_description.push_str(&data),
-                        _ => {}
-                    }
-                }
+                let current = state.current_element.clone();
+                tags::dispatch_text(&current, &data, &mut state);
+            }
+
+            // CDATA is also textual content — treat it the same as Characters
+            Ok(XmlEvent::CData(data)) => {
+                let current = state.current_element.clone();
+                tags::dispatch_text(&current, &data, &mut state);
             }
 
             //A tag is closed.
             Ok(XmlEvent::EndElement { name }) => {
-                // Close channel <image> scope
-                if name.local_name == "image" && in_channel_image {
-                    in_channel_image = false;
-                }
-                // When closing channel, emit one INSERT-equivalent record for newsfeeds table
-                if name.local_name == "channel" && in_channel {
-                    in_channel = false;
-                    let record = SqlInsert {
-                        table: "newsfeeds".to_string(),
-                        columns: vec![
-                            "feed_id".to_string(),
-                            "title".to_string(),
-                            "link".to_string(),
-                            "description".to_string(),
-                        ],
-                        values: vec![
-                            match feed_id { Some(v) => JsonValue::from(v), None => JsonValue::Null },
-                            JsonValue::from(channel_title.trim().to_string()),
-                            JsonValue::from(channel_link.trim().to_string()),
-                            JsonValue::from(channel_description.trim().to_string()),
-                        ],
-                        feed_id,
-                    };
-
-                    // Use per-run outputs subfolder established at startup
-                    let out_dir: PathBuf = OUTPUT_SUBDIR
-                        .get()
-                        .cloned()
-                        .unwrap_or_else(|| PathBuf::from("outputs"));
-                    if let Err(e) = fs::create_dir_all(&out_dir) {
-                        eprintln!("Failed to create outputs directory '{}': {}", out_dir.display(), e);
-                    }
-
-                    // Compute counter (1-based) and build filename
-                    let counter_val = GLOBAL_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-                    let fid_for_name = feed_id
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "NULL".to_string());
-                    let file_name = format!("{}_{}_{}.json", counter_val, "newsfeeds", fid_for_name);
-                    let file_path = out_dir.join(file_name);
-
-                    match serde_json::to_string(&record) {
-                        Ok(serialized) => {
-                            if let Err(e) = fs::write(&file_path, serialized) {
-                                eprintln!("Failed to write {}: {}", file_path.display(), e);
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to serialize record for newsfeeds: {}", e);
-                        }
-                    }
-                }
-                // Close podcast:funding scope if needed
-                if name.local_name == "funding" && in_podcast_funding {
-                    in_podcast_funding = false;
-                }
-
-                // When closing item, emit one INSERT-equivalent record for nfitems table
-                if name.local_name == "item" {
-                    in_item = false;
-
-                    // Build the INSERT-equivalent record for the current item
-                    let record = SqlInsert {
-                        table: "nfitems".to_string(),
-                        columns: vec![
-                            "feed_id".to_string(),
-                            "title".to_string(),
-                            "link".to_string(),
-                            "description".to_string(),
-                            "pub_date".to_string(),
-                            "itunes_image".to_string(),
-                            "podcast_funding_url".to_string(),
-                            "podcast_funding_text".to_string(),
-                        ],
-                        values: vec![
-                            match feed_id { Some(v) => JsonValue::from(v), None => JsonValue::Null },
-                            JsonValue::from(title.clone()),
-                            JsonValue::from(link.clone()),
-                            JsonValue::from(description.clone()),
-                            JsonValue::from(pub_date.clone()),
-                            JsonValue::from(itunes_image.clone()),
-                            JsonValue::from(podcast_funding_url.clone()),
-                            JsonValue::from(podcast_funding_text.trim().to_string()),
-                        ],
-                        feed_id,
-                    };
-
-                    // Use a per-run outputs subfolder established at startup
-                    let out_dir: PathBuf = OUTPUT_SUBDIR
-                        .get()
-                        .cloned()
-                        .unwrap_or_else(|| PathBuf::from("outputs"));
-                    if let Err(e) = fs::create_dir_all(&out_dir) {
-                        eprintln!("Failed to create outputs directory '{}': {}", out_dir.display(), e);
-                    }
-
-                    // Compute counter (1-based) and build filename
-                    let counter_val = GLOBAL_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-                    let fid_for_name = feed_id
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "NULL".to_string());
-                    let file_name = format!("{}_{}_{}.json", counter_val, "nfitems", fid_for_name);
-                    let file_path = out_dir.join(file_name);
-
-                    match serde_json::to_string(&record) {
-                        Ok(serialized) => {
-                            if let Err(e) = fs::write(&file_path, serialized) {
-                                eprintln!("Failed to write {}: {}", file_path.display(), e);
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to serialize record for nfitems: {}", e);
-                        }
-                    }
-                }
+                tags::dispatch_end(&name, feed_id, &mut state);
             }
 
             //An error occurred.
@@ -492,5 +288,209 @@ where
         .await
     {
         eprintln!("Error in async processing for '{}': {}", source_name, e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::io::Cursor;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir() -> PathBuf {
+        let base = std::env::temp_dir();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let dir = base.join(format!("feedparser_test_{}", ts));
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    fn ensure_output_dir() -> PathBuf {
+        if let Some(existing) = OUTPUT_SUBDIR.get() {
+            return existing.clone();
+        }
+        let dir = unique_temp_dir();
+        let _ = OUTPUT_SUBDIR.set(dir.clone());
+        dir
+    }
+
+    #[test]
+    fn writes_channel_title_to_newsfeeds_output() {
+        // Arrange: ensure outputs directory is set once for all tests in this process
+        let out_dir = ensure_output_dir();
+
+        // Synthetic input: 4 header lines followed by minimal RSS with channel title
+        let last_modified = "0"; // placeholder
+        let etag = "[[NO_ETAG]]";
+        let url = "https://example.com/feed.xml";
+        let downloaded = "0";
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>My Test Channel</title>
+  </channel>
+</rss>"#;
+
+        let input = format!(
+            "{last}\n{etag}\n{url}\n{dl}\n{xml}\n",
+            last = last_modified,
+            etag = etag,
+            url = url,
+            dl = downloaded,
+            xml = xml
+        );
+
+        let feed_id = Some(424242_i64);
+
+        // Act: process the synthetic feed synchronously
+        process_feed_sync(Cursor::new(input.into_bytes()), "<test>", feed_id);
+
+        // Assert: a newsfeeds JSON file exists with the expected title
+        let entries = fs::read_dir(&out_dir)
+            .expect("output directory should be readable");
+        let mut found_path: Option<PathBuf> = None;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                if name.contains("_newsfeeds_") && name.ends_with("424242.json") {
+                    found_path = Some(path);
+                    break;
+                }
+            }
+        }
+
+        let file_path = found_path.expect("should have written a newsfeeds output file");
+        let contents = fs::read_to_string(&file_path)
+            .expect("should be able to read newsfeeds file");
+        let v: serde_json::Value = serde_json::from_str(&contents)
+            .expect("valid JSON in newsfeeds file");
+
+        // Basic shape assertions
+        assert_eq!(v["table"], "newsfeeds");
+        assert_eq!(v["columns"][1], "title");
+        assert_eq!(v["feed_id"], serde_json::json!(424242));
+
+        // Channel title should be the second value (index 1), trimmed
+        assert_eq!(v["values"][1], serde_json::json!("My Test Channel"));
+    }
+
+    #[test]
+    fn writes_channel_link_and_description_cdata() {
+        // Arrange
+        let out_dir = ensure_output_dir();
+
+        let last_modified = "0";
+        let etag = "[[NO_ETAG]]";
+        let url = "https://example.com/feed.xml";
+        let downloaded = "0";
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Channel With Links</title>
+    <link>https://example.com/</link>
+    <description><![CDATA[ This is a <b>CDATA</b> description. ]]></description>
+  </channel>
+</rss>"#;
+
+        let input = format!(
+            "{last}\n{etag}\n{url}\n{dl}\n{xml}\n",
+            last = last_modified,
+            etag = etag,
+            url = url,
+            dl = downloaded,
+            xml = xml
+        );
+
+        let feed_id = Some(777001_i64);
+
+        // Act
+        process_feed_sync(Cursor::new(input.into_bytes()), "<test>", feed_id);
+
+        // Assert: find the newsfeeds file for this feed_id
+        let entries = fs::read_dir(&out_dir).expect("output directory should be readable");
+        let mut found_path: Option<PathBuf> = None;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                if name.contains("_newsfeeds_") && name.ends_with("777001.json") {
+                    found_path = Some(path);
+                    break;
+                }
+            }
+        }
+
+        let file_path = found_path.expect("should have written a newsfeeds output file");
+        let contents = fs::read_to_string(&file_path).expect("read newsfeeds file");
+        let v: serde_json::Value = serde_json::from_str(&contents).expect("valid JSON");
+
+        assert_eq!(v["table"], "newsfeeds");
+        // title
+        assert_eq!(v["values"][1], serde_json::json!("Channel With Links"));
+        // link
+        assert_eq!(v["values"][2], serde_json::json!("https://example.com/"));
+        // description (trimmed)
+        assert_eq!(v["values"][3], serde_json::json!("This is a <b>CDATA</b> description."));
+    }
+
+    #[test]
+    fn writes_item_title_link_description_with_cdata() {
+        // Arrange
+        let out_dir = ensure_output_dir();
+
+        let last_modified = "0";
+        let etag = "[[NO_ETAG]]";
+        let url = "https://example.com/feed.xml";
+        let downloaded = "0";
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Channel</title>
+    <item>
+      <title>Episode 1</title>
+      <link>https://example.com/ep1</link>
+      <description><![CDATA[ Hello & welcome! ]]></description>
+    </item>
+  </channel>
+</rss>"#;
+
+        let input = format!(
+            "{last}\n{etag}\n{url}\n{dl}\n{xml}\n",
+            last = last_modified,
+            etag = etag,
+            url = url,
+            dl = downloaded,
+            xml = xml
+        );
+
+        let feed_id = Some(777002_i64);
+
+        // Act
+        process_feed_sync(Cursor::new(input.into_bytes()), "<test>", feed_id);
+
+        // Assert: find the nfitems file for this feed_id
+        let entries = fs::read_dir(&out_dir).expect("output directory should be readable");
+        let mut found_path: Option<PathBuf> = None;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                if name.contains("_nfitems_") && name.ends_with("777002.json") {
+                    found_path = Some(path);
+                    break;
+                }
+            }
+        }
+
+        let file_path = found_path.expect("should have written an nfitems output file");
+        let contents = fs::read_to_string(&file_path).expect("read nfitems file");
+        let v: serde_json::Value = serde_json::from_str(&contents).expect("valid JSON");
+
+        assert_eq!(v["table"], "nfitems");
+        assert_eq!(v["values"][1], serde_json::json!("Episode 1"));
+        assert_eq!(v["values"][2], serde_json::json!("https://example.com/ep1"));
+        assert_eq!(v["values"][3], serde_json::json!("Hello & welcome!"));
     }
 }

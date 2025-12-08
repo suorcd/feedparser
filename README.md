@@ -82,6 +82,10 @@ cargo run
 # Run tests
 cargo test
 ```
+## AI/LLM
+This project is being developed by the Podcasting 2.0 community.  We are using AI/LLM's to assist with project management, coding and code review.
+The history of any LLM operations on this project can be found in the [.llm_history](.llm_history) folder.  Agent readable guidelines are in the
+[.junie/guidelines.md](.junie/guidelines.md) file.
 
 # Contributors
 - Dave Jones (gh: [@daveajones](https://github.com/daveajones))
