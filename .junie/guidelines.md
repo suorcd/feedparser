@@ -56,12 +56,12 @@ Two logical tables are emitted:
 
 ## JSON Schemas
 - newsfeeds
-  - columns: `["feed_id", "title", "link", "description"]`
-  - values: `[feed_id or null, channel_title.trim(), channel_link.trim(), channel_description.trim()]`
+  - columns: `["feed_id", "title", "link", "description", "generator"]`
+  - values: `[feed_id or null, channel_title.trim(), channel_link.trim(), channel_description.trim(), channel_generator.trim()]`
 
 - nfitems
   - columns: `["feed_id", "title", "link", "description", "pub_date", "itunes_image", "podcast_funding_url", "podcast_funding_text"]`
-  - values: `[feed_id or null, title, link, description, pub_date, itunes_image, podcast_funding_url, podcast_funding_text.trim()]`
+  - values: `[feed_id or null, title, link, description.trim(), pub_date, itunes_image, podcast_funding_url, podcast_funding_text.trim()]`
 
 Note: CDATA sections are treated like normal text; both `Characters` and `CData` XML events are accumulated.
 
@@ -82,6 +82,7 @@ To add support for a new XML element:
 - Follow existing naming and module patterns; keep handlers small and tag-focused.
 - Avoid global mutable state beyond the provided `GLOBAL_COUNTER` and `OUTPUT_SUBDIR`.
 - Prefer trimming of channel-level strings at write time; item strings are kept as-is except where otherwise specified.
+  - Update: item `description` is now trimmed; `podcast_funding_text` remains trimmed.
 
 ## Performance Notes
 - The async `main` function enumerates input files and executes parsing on a blocking thread via `tokio::task::spawn_blocking`.
