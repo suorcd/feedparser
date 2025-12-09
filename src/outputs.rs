@@ -49,12 +49,14 @@ pub fn write_newsfeeds(state: &ParserState, feed_id: Option<i64>) {
             "title".to_string(),
             "link".to_string(),
             "description".to_string(),
+            "generator".to_string(),
         ],
         values: vec![
             match feed_id { Some(v) => JsonValue::from(v), None => JsonValue::Null },
             JsonValue::from(state.channel_title.trim().to_string()),
             JsonValue::from(state.channel_link.trim().to_string()),
             JsonValue::from(state.channel_description.trim().to_string()),
+            JsonValue::from(state.channel_generator.trim().to_string()),
         ],
         feed_id,
     };
@@ -78,7 +80,8 @@ pub fn write_nfitems(state: &ParserState, feed_id: Option<i64>) {
             match feed_id { Some(v) => JsonValue::from(v), None => JsonValue::Null },
             JsonValue::from(state.title.clone()),
             JsonValue::from(state.link.clone()),
-            JsonValue::from(state.description.clone()),
+            // Trim item description to normalize whitespace similar to channel fields
+            JsonValue::from(state.description.trim().to_string()),
             JsonValue::from(state.pub_date.clone()),
             JsonValue::from(state.itunes_image.clone()),
             JsonValue::from(state.podcast_funding_url.clone()),

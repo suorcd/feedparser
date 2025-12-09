@@ -184,9 +184,11 @@ fn process_feed_sync<R: Read>(reader: R, _source_name: &str, feed_id: Option<i64
                 "title".to_string(),
                 "link".to_string(),
                 "description".to_string(),
+                "generator".to_string(),
             ],
             values: vec![
                 match feed_id { Some(v) => JsonValue::from(v), None => JsonValue::Null },
+                JsonValue::from(String::new()),
                 JsonValue::from(String::new()),
                 JsonValue::from(String::new()),
                 JsonValue::from(String::new()),
@@ -492,5 +494,58 @@ mod tests {
         assert_eq!(v["values"][1], serde_json::json!("Episode 1"));
         assert_eq!(v["values"][2], serde_json::json!("https://example.com/ep1"));
         assert_eq!(v["values"][3], serde_json::json!("Hello & welcome!"));
+    }
+
+    #[test]
+    fn writes_channel_generator_to_newsfeeds_output() {
+        // Arrange
+        let out_dir = ensure_output_dir();
+
+        let last_modified = "0";
+        let etag = "[[NO_ETAG]]";
+        let url = "https://example.com/feed.xml";
+        let downloaded = "0";
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Channel Gen</title>
+    <generator> WordPress 6.5.2 </generator>
+  </channel>
+</rss>"#;
+
+        let input = format!(
+            "{last}\n{etag}\n{url}\n{dl}\n{xml}\n",
+            last = last_modified,
+            etag = etag,
+            url = url,
+            dl = downloaded,
+            xml = xml
+        );
+
+        let feed_id = Some(900901_i64);
+
+        // Act
+        process_feed_sync(Cursor::new(input.into_bytes()), "<test>", feed_id);
+
+        // Assert: find the newsfeeds file for this feed_id
+        let entries = fs::read_dir(&out_dir).expect("output directory should be readable");
+        let mut found_path: Option<PathBuf> = None;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                if name.contains("_newsfeeds_") && name.ends_with("900901.json") {
+                    found_path = Some(path);
+                    break;
+                }
+            }
+        }
+
+        let file_path = found_path.expect("should have written a newsfeeds output file");
+        let contents = fs::read_to_string(&file_path).expect("read newsfeeds file");
+        let v: serde_json::Value = serde_json::from_str(&contents).expect("valid JSON");
+
+        assert_eq!(v["table"], "newsfeeds");
+        // generator is the 5th value (index 4) and should be trimmed
+        assert_eq!(v["values"][4], serde_json::json!("WordPress 6.5.2"));
     }
 }
