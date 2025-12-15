@@ -1,31 +1,26 @@
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::io::Cursor;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::sync::OnceLock;
 use std::path::{PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
-use serde::Serialize;
-use serde_json::Value as JsonValue;
-use xml::reader::{EventReader, XmlEvent};
+use xml::reader::{XmlEvent, ParserConfig};
+use xml::name::OwnedName;
 
 mod parser_state;
+mod models;
 mod tags;
 mod outputs;
+#[cfg(test)]
+mod tests;
+mod utils;
 use parser_state::ParserState;
 
 // Global counter initialized to zero at program start
 pub(crate) static GLOBAL_COUNTER: AtomicUsize = AtomicUsize::new(0);
 // Per-run output subfolder based on startup UNIX timestamp
 pub(crate) static OUTPUT_SUBDIR: OnceLock<PathBuf> = OnceLock::new();
-
-#[derive(Serialize)]
-pub struct SqlInsert {
-    pub table: String,
-    pub columns: Vec<String>,
-    pub values: Vec<JsonValue>,
-    pub feed_id: Option<i64>,
-}
 
 #[tokio::main]
 async fn main() {
@@ -176,80 +171,53 @@ fn process_feed_sync<R: Read>(reader: R, _source_name: &str, feed_id: Option<i64
         .any(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'));
 
     if !has_non_whitespace {
-        // XML payload is empty or whitespace-only: write a single channel-level record with blank fields
-        let record = SqlInsert {
-            table: "newsfeeds".to_string(),
-            columns: vec![
-                "feed_id".to_string(),
-                "title".to_string(),
-                "link".to_string(),
-                "description".to_string(),
-                "generator".to_string(),
-                "itunes_author".to_string(),
-            ],
-            values: vec![
-                match feed_id { Some(v) => JsonValue::from(v), None => JsonValue::Null },
-                JsonValue::from(String::new()),
-                JsonValue::from(String::new()),
-                JsonValue::from(String::new()),
-                JsonValue::from(String::new()),
-                JsonValue::from(String::new()),
-            ],
-            feed_id,
-        };
-
-        // Use per-run outputs subfolder established at startup
-        let out_dir: PathBuf = OUTPUT_SUBDIR
-            .get()
-            .cloned()
-            .unwrap_or_else(|| PathBuf::from("outputs"));
-        if let Err(e) = fs::create_dir_all(&out_dir) {
-            eprintln!("Failed to create outputs directory '{}': {}", out_dir.display(), e);
-        }
-
-        // Compute counter (1-based) and build filename
-        let counter_val = GLOBAL_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-        let fid_for_name = feed_id
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "NULL".to_string());
-        let file_name = format!("{}_{}_{}.json", counter_val, "newsfeeds", fid_for_name);
-        let file_path = out_dir.join(file_name);
-
-        match serde_json::to_string(&record) {
-            Ok(serialized) => {
-                if let Err(e) = fs::write(&file_path, serialized) {
-                    eprintln!("Failed to write {}: {}", file_path.display(), e);
-                } else {
-                    println!(
-                        "Empty XML payload detected for '{}'; wrote blank newsfeeds record to {}",
-                        _source_name,
-                        file_path.display()
-                    );
-                }
-            }
-            Err(e) => {
-                eprintln!("Failed to serialize blank newsfeeds record: {}", e);
-            }
-        }
-
-        // Nothing else to do for this file
+        // XML payload is empty or whitespace-only: emit a single newsfeeds row matching partytime shape
+        let state = ParserState::default();
+        outputs::write_newsfeeds(&state, feed_id);
         return;
     }
 
     // Create an XML parser from the buffered payload
     let cursor = Cursor::new(xml_bytes);
-    let parser = EventReader::new(cursor);
+    let config = ParserConfig::new();
+    let config = utils::add_html_entities_to_parser_config(config);
+    let parser = config.create_reader(cursor);
 
     // Parser state holds all flags and accumulators used by handlers
     let mut state = ParserState::default();
+
+    fn get_prefixed_name(name: &OwnedName) -> String {
+        let prefix = name.prefix.clone();
+        let local_name = name.local_name.clone();
+
+        if (matches!(prefix.as_deref(), Some("itunes"))
+            || matches!(name.namespace.as_deref(), Some("http://www.itunes.com/dtds/podcast-1.0.dtd"))
+        ) {
+            format!("itunes:{}", local_name)
+        } else if (matches!(prefix.as_deref(), Some("podcast"))
+            || matches!(name.namespace.as_deref(), Some("https://podcastindex.org/namespace/1.0"))
+            || matches!(name.namespace.as_deref(), Some("http://podcastindex.org/namespace/1.0"))
+        ) {
+            format!("podcast:{}", local_name)
+        } else if name.prefix.as_deref() == Some("atom")
+            || matches!(name.namespace.as_deref(), Some("http://www.w3.org/2005/Atom")
+        ) {
+            format!("atom:{}", local_name)
+        } else if prefix.is_some() {
+            format!("{}:{}", prefix.unwrap(), local_name)
+        } else {
+            local_name
+        }
+    }
 
     // Parse the XML document
     for event in parser {
         match event {
             //A tag is opened.
             Ok(XmlEvent::StartElement { name, attributes, .. }) => {
-                state.current_element = name.local_name.clone();
-                tags::dispatch_start(&name, &attributes, &mut state);
+                state.current_element = get_prefixed_name(&name);
+                let current = state.current_element.clone();
+                tags::dispatch_start(&current, &attributes, &mut state);
             }
 
             //Text is found.
@@ -266,7 +234,9 @@ fn process_feed_sync<R: Read>(reader: R, _source_name: &str, feed_id: Option<i64
 
             //A tag is closed.
             Ok(XmlEvent::EndElement { name }) => {
-                tags::dispatch_end(&name, feed_id, &mut state);
+                state.current_element = get_prefixed_name(&name);
+                let current = state.current_element.clone();
+                tags::dispatch_end(&current, feed_id, &mut state);
             }
 
             //An error occurred.
@@ -292,371 +262,5 @@ where
         .await
     {
         eprintln!("Error in async processing for '{}': {}", source_name, e);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::io::Cursor;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn unique_temp_dir() -> PathBuf {
-        let base = std::env::temp_dir();
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let dir = base.join(format!("feedparser_test_{}", ts));
-        let _ = fs::create_dir_all(&dir);
-        dir
-    }
-
-    fn ensure_output_dir() -> PathBuf {
-        if let Some(existing) = OUTPUT_SUBDIR.get() {
-            return existing.clone();
-        }
-        let dir = unique_temp_dir();
-        let _ = OUTPUT_SUBDIR.set(dir.clone());
-        dir
-    }
-
-    #[test]
-    fn writes_channel_title_to_newsfeeds_output() {
-        // Arrange: ensure outputs directory is set once for all tests in this process
-        let out_dir = ensure_output_dir();
-
-        // Synthetic input: 4 header lines followed by minimal RSS with channel title
-        let last_modified = "0"; // placeholder
-        let etag = "[[NO_ETAG]]";
-        let url = "https://example.com/feed.xml";
-        let downloaded = "0";
-        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0">
-  <channel>
-    <title>My Test Channel</title>
-  </channel>
-</rss>"#;
-
-        let input = format!(
-            "{last}\n{etag}\n{url}\n{dl}\n{xml}\n",
-            last = last_modified,
-            etag = etag,
-            url = url,
-            dl = downloaded,
-            xml = xml
-        );
-
-        let feed_id = Some(424242_i64);
-
-        // Act: process the synthetic feed synchronously
-        process_feed_sync(Cursor::new(input.into_bytes()), "<test>", feed_id);
-
-        // Assert: a newsfeeds JSON file exists with the expected title
-        let entries = fs::read_dir(&out_dir)
-            .expect("output directory should be readable");
-        let mut found_path: Option<PathBuf> = None;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                if name.contains("_newsfeeds_") && name.ends_with("424242.json") {
-                    found_path = Some(path);
-                    break;
-                }
-            }
-        }
-
-        let file_path = found_path.expect("should have written a newsfeeds output file");
-        let contents = fs::read_to_string(&file_path)
-            .expect("should be able to read newsfeeds file");
-        let v: serde_json::Value = serde_json::from_str(&contents)
-            .expect("valid JSON in newsfeeds file");
-
-        // Basic shape assertions
-        assert_eq!(v["table"], "newsfeeds");
-        assert_eq!(v["columns"][1], "title");
-        assert_eq!(v["feed_id"], serde_json::json!(424242));
-
-        // Channel title should be the second value (index 1), trimmed
-        assert_eq!(v["values"][1], serde_json::json!("My Test Channel"));
-    }
-
-    #[test]
-    fn writes_channel_link_and_description_cdata() {
-        // Arrange
-        let out_dir = ensure_output_dir();
-
-        let last_modified = "0";
-        let etag = "[[NO_ETAG]]";
-        let url = "https://example.com/feed.xml";
-        let downloaded = "0";
-        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0">
-  <channel>
-    <title>Channel With Links</title>
-    <link>https://example.com/</link>
-    <description><![CDATA[ This is a <b>CDATA</b> description. ]]></description>
-  </channel>
-</rss>"#;
-
-        let input = format!(
-            "{last}\n{etag}\n{url}\n{dl}\n{xml}\n",
-            last = last_modified,
-            etag = etag,
-            url = url,
-            dl = downloaded,
-            xml = xml
-        );
-
-        let feed_id = Some(777001_i64);
-
-        // Act
-        process_feed_sync(Cursor::new(input.into_bytes()), "<test>", feed_id);
-
-        // Assert: find the newsfeeds file for this feed_id
-        let entries = fs::read_dir(&out_dir).expect("output directory should be readable");
-        let mut found_path: Option<PathBuf> = None;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                if name.contains("_newsfeeds_") && name.ends_with("777001.json") {
-                    found_path = Some(path);
-                    break;
-                }
-            }
-        }
-
-        let file_path = found_path.expect("should have written a newsfeeds output file");
-        let contents = fs::read_to_string(&file_path).expect("read newsfeeds file");
-        let v: serde_json::Value = serde_json::from_str(&contents).expect("valid JSON");
-
-        assert_eq!(v["table"], "newsfeeds");
-        // title
-        assert_eq!(v["values"][1], serde_json::json!("Channel With Links"));
-        // link
-        assert_eq!(v["values"][2], serde_json::json!("https://example.com/"));
-        // description (trimmed)
-        assert_eq!(v["values"][3], serde_json::json!("This is a <b>CDATA</b> description."));
-    }
-
-    #[test]
-    fn writes_item_title_link_description_with_cdata() {
-        // Arrange
-        let out_dir = ensure_output_dir();
-
-        let last_modified = "0";
-        let etag = "[[NO_ETAG]]";
-        let url = "https://example.com/feed.xml";
-        let downloaded = "0";
-        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0">
-  <channel>
-    <title>Channel</title>
-    <item>
-      <title>Episode 1</title>
-      <link>https://example.com/ep1</link>
-      <description><![CDATA[ Hello & welcome! ]]></description>
-    </item>
-  </channel>
-</rss>"#;
-
-        let input = format!(
-            "{last}\n{etag}\n{url}\n{dl}\n{xml}\n",
-            last = last_modified,
-            etag = etag,
-            url = url,
-            dl = downloaded,
-            xml = xml
-        );
-
-        let feed_id = Some(777002_i64);
-
-        // Act
-        process_feed_sync(Cursor::new(input.into_bytes()), "<test>", feed_id);
-
-        // Assert: find the nfitems file for this feed_id
-        let entries = fs::read_dir(&out_dir).expect("output directory should be readable");
-        let mut found_path: Option<PathBuf> = None;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                if name.contains("_nfitems_") && name.ends_with("777002.json") {
-                    found_path = Some(path);
-                    break;
-                }
-            }
-        }
-
-        let file_path = found_path.expect("should have written an nfitems output file");
-        let contents = fs::read_to_string(&file_path).expect("read nfitems file");
-        let v: serde_json::Value = serde_json::from_str(&contents).expect("valid JSON");
-
-        assert_eq!(v["table"], "nfitems");
-        assert_eq!(v["values"][1], serde_json::json!("Episode 1"));
-        assert_eq!(v["values"][2], serde_json::json!("https://example.com/ep1"));
-        assert_eq!(v["values"][3], serde_json::json!("Hello & welcome!"));
-    }
-
-    #[test]
-    fn writes_channel_itunes_author_to_newsfeeds_output() {
-        // Arrange
-        let out_dir = ensure_output_dir();
-
-        let last_modified = "0";
-        let etag = "[[NO_ETAG]]";
-        let url = "https://example.com/feed.xml";
-        let downloaded = "0";
-        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
-  <channel>
-    <title>Channel With iTunes</title>
-    <itunes:author>  ACME Media  </itunes:author>
-  </channel>
-</rss>"#;
-
-        let input = format!(
-            "{last}\n{etag}\n{url}\n{dl}\n{xml}\n",
-            last = last_modified,
-            etag = etag,
-            url = url,
-            dl = downloaded,
-            xml = xml
-        );
-
-        let feed_id = Some(808001_i64);
-
-        // Act
-        process_feed_sync(Cursor::new(input.into_bytes()), "<test>", feed_id);
-
-        // Assert: find the newsfeeds file for this feed_id
-        let entries = fs::read_dir(&out_dir).expect("output directory should be readable");
-        let mut found_path: Option<PathBuf> = None;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                if name.contains("_newsfeeds_") && name.ends_with("808001.json") {
-                    found_path = Some(path);
-                    break;
-                }
-            }
-        }
-
-        let file_path = found_path.expect("should have written a newsfeeds output file");
-        let contents = fs::read_to_string(&file_path).expect("read newsfeeds file");
-        let v: serde_json::Value = serde_json::from_str(&contents).expect("valid JSON");
-
-        assert_eq!(v["table"], "newsfeeds");
-        // itunes_author is the 6th value (index 5) and should be trimmed
-        assert_eq!(v["values"][5], serde_json::json!("ACME Media"));
-    }
-
-    #[test]
-    fn writes_item_itunes_author_to_nfitems_output() {
-        // Arrange
-        let out_dir = ensure_output_dir();
-
-        let last_modified = "0";
-        let etag = "[[NO_ETAG]]";
-        let url = "https://example.com/feed.xml";
-        let downloaded = "0";
-        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
-  <channel>
-    <title>Channel</title>
-    <item>
-      <title>Episode A</title>
-      <itunes:author> Guest Speaker </itunes:author>
-    </item>
-  </channel>
-</rss>"#;
-
-        let input = format!(
-            "{last}\n{etag}\n{url}\n{dl}\n{xml}\n",
-            last = last_modified,
-            etag = etag,
-            url = url,
-            dl = downloaded,
-            xml = xml
-        );
-
-        let feed_id = Some(808002_i64);
-
-        // Act
-        process_feed_sync(Cursor::new(input.into_bytes()), "<test>", feed_id);
-
-        // Assert: find the nfitems file for this feed_id
-        let entries = fs::read_dir(&out_dir).expect("output directory should be readable");
-        let mut found_path: Option<PathBuf> = None;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                if name.contains("_nfitems_") && name.ends_with("808002.json") {
-                    found_path = Some(path);
-                    break;
-                }
-            }
-        }
-
-        let file_path = found_path.expect("should have written an nfitems output file");
-        let contents = fs::read_to_string(&file_path).expect("read nfitems file");
-        let v: serde_json::Value = serde_json::from_str(&contents).expect("valid JSON");
-
-        assert_eq!(v["table"], "nfitems");
-        // itunes_author is the 7th value (index 6) for nfitems
-        assert_eq!(v["values"][6], serde_json::json!("Guest Speaker"));
-    }
-
-    #[test]
-    fn writes_channel_generator_to_newsfeeds_output() {
-        // Arrange
-        let out_dir = ensure_output_dir();
-
-        let last_modified = "0";
-        let etag = "[[NO_ETAG]]";
-        let url = "https://example.com/feed.xml";
-        let downloaded = "0";
-        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0">
-  <channel>
-    <title>Channel Gen</title>
-    <generator> WordPress 6.5.2 </generator>
-  </channel>
-</rss>"#;
-
-        let input = format!(
-            "{last}\n{etag}\n{url}\n{dl}\n{xml}\n",
-            last = last_modified,
-            etag = etag,
-            url = url,
-            dl = downloaded,
-            xml = xml
-        );
-
-        let feed_id = Some(900901_i64);
-
-        // Act
-        process_feed_sync(Cursor::new(input.into_bytes()), "<test>", feed_id);
-
-        // Assert: find the newsfeeds file for this feed_id
-        let entries = fs::read_dir(&out_dir).expect("output directory should be readable");
-        let mut found_path: Option<PathBuf> = None;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                if name.contains("_newsfeeds_") && name.ends_with("900901.json") {
-                    found_path = Some(path);
-                    break;
-                }
-            }
-        }
-
-        let file_path = found_path.expect("should have written a newsfeeds output file");
-        let contents = fs::read_to_string(&file_path).expect("read newsfeeds file");
-        let v: serde_json::Value = serde_json::from_str(&contents).expect("valid JSON");
-
-        assert_eq!(v["table"], "newsfeeds");
-        // generator is the 5th value (index 4) and should be trimmed
-        assert_eq!(v["values"][4], serde_json::json!("WordPress 6.5.2"));
     }
 }
